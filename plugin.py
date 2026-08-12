@@ -12,8 +12,14 @@ device on this network, LAN owns its state and control; otherwise the cloud
 does. Discovery can UNDISCOVER. State is pushed (mDNS + eWeLink WebSocket); a
 slow poll reconciles and fetches power/V/A; a uiActive nudge streams live power.
 """
-import sys, json, time, hashlib, hmac, base64, secrets, threading
+import sys, os, json, time, hashlib, hmac, base64, secrets, threading
 import urllib.request, urllib.parse
+# vendored deps live beside this file (pip install --target vendor/), so the
+# plugin carries pycryptodome/zeroconf/websocket-client and survives a Signal K
+# container recreation without touching the image.
+_vendor = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor")
+if os.path.isdir(_vendor):
+    sys.path.insert(0, _vendor)
 from Crypto.Cipher import AES
 from zeroconf import Zeroconf, ServiceBrowser
 try:
@@ -65,7 +71,6 @@ class CloudAuth:
             log(f"token file {self.file} unreadable: {e}")
 
     def save(self):
-        import os
         tmp = self.file + ".tmp"
         with open(tmp, "w") as f:
             json.dump(self.tok, f)
@@ -122,7 +127,6 @@ def decrypt(props, devkey):
     return json.loads(pt[: -pt[-1]])
 
 def encrypt(params, devkey):
-    import os
     iv = os.urandom(16)
     data = json.dumps(params).encode()
     data += bytes([16 - len(data) % 16]) * (16 - len(data) % 16)
