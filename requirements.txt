@@ -1,0 +1,3 @@
+pycryptodome>=3.20
+zeroconf>=0.132
+websocket-client>=1.8

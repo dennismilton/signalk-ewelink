@@ -1,0 +1,24 @@
+{
+  "name": "signalk-ewelink",
+  "version": "1.0.0",
+  "description": "eWeLink/Sonoff devices in Signal K — LAN-first, cloud-fallback, push not poll",
+  "main": "index.js",
+  "scripts": {
+    "test": "python3 -c \"import ast; ast.parse(open('plugin.py').read())\""
+  },
+  "keywords": [
+    "signalk-node-server-plugin",
+    "signalk-category-digital-switching",
+    "signalk-category-hardware",
+    "ewelink",
+    "sonoff",
+    "powr3",
+    "lan",
+    "marine"
+  ],
+  "author": "Dennis Milton",
+  "license": "MIT",
+  "engines": {
+    "node": ">=16"
+  }
+}
