@@ -1,7 +1,7 @@
 {
   "name": "signalk-ewelink",
   "version": "1.0.0",
-  "description": "eWeLink/Sonoff devices in Signal K — LAN-first, cloud-fallback, push not poll",
+  "description": "eWeLink/Sonoff devices as native Signal K \u2014 LAN-first, cloud-fallback, push not poll, live power. No MQTT.",
   "main": "index.js",
   "scripts": {
     "test": "python3 -c \"import ast; ast.parse(open('plugin.py').read())\""
@@ -16,9 +16,25 @@
     "lan",
     "marine"
   ],
-  "author": "Dennis Milton",
+  "author": "Dennis Milton (https://github.com/dennismilton)",
   "license": "MIT",
   "engines": {
     "node": ">=16"
-  }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dennismilton/signalk-ewelink.git"
+  },
+  "bugs": {
+    "url": "https://github.com/dennismilton/signalk-ewelink/issues"
+  },
+  "homepage": "https://github.com/dennismilton/signalk-ewelink#readme",
+  "files": [
+    "index.js",
+    "plugin.py",
+    "requirements.txt",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ]
 }
