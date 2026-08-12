@@ -51,7 +51,7 @@ module.exports = function (app) {
           title: 'eWeLink cloud (OAuth2.0)',
           properties: {
             appId: { type: 'string', title: 'App ID' },
-            appSecret: { type: 'string', title: 'App secret' },
+            appSecret: { type: 'string', title: 'App secret', format: 'password' },
             region: { type: 'string', title: 'Region', default: 'eu',
               enum: ['eu', 'us', 'as', 'cn'] }
           }
