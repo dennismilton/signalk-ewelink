@@ -41,21 +41,23 @@ share the device's LAN (host networking if containerised).
 
 ## Config (Signal K admin UI)
 
-- **Device keys file** — path to a JSON `{ deviceId: devicekey }`. Secrets live
-  here, not in the plugin config, which Signal K stores in plaintext. Fetch a
-  devicekey once from the cloud device list (`/v2/device/thing`).
-- **eWeLink cloud (OAuth2.0)** — app id/secret from
-  [dev.ewelink.cc](https://dev.ewelink.cc), region, token store path. Needed for
-  cloud fallback and for POWR3 power readings. Run the one-time login (see
-  `auth` in the standalone bridge, or paste a token file). Omit to run
-  LAN-discovered devices only.
-- **Devices** — for each: `id`, `kind` (`single` | `multi`), `channels`, and a
-  Signal K `basePath`:
-  - `single` → `basePath.state` `.power` `.voltage` `.current`
-  - `multi`  → `basePath.chN.state` and `basePath.online`
+Enable the plugin, enter your **eWeLink OAuth** app id/secret and region, save.
+Reopen the config page and pick devices from the **Device** dropdown (populated
+by discovery — cloud device list + mDNS). For each, set its `kind`
+(`single`/`multi`), channel count, and a Signal K `basePath`
+(e.g. `electrical.ac.shore` or `electrical.switches.ewe4`).
 
-Example: a POWR3 as `electrical.ac.shore`, a 4-channel switch as
-`electrical.switches.ewe4`.
+Devicekeys are fetched from the cloud and cached automatically — there is no keys
+file. OAuth tokens are obtained once (see the standalone
+[ewelink-mqtt-bridge](https://github.com/dennismilton/ewelink-mqtt-bridge) `auth`
+flow) and stored beside the plugin.
+
+## Python
+
+The worker is Python. Install its deps against the python3 the Signal K server
+runs (on modern Debian/Raspberry Pi OS that means a venv or
+`pip install --break-system-packages`, or `pip install --target vendor/` inside
+the plugin dir). The official Signal K docker image ships without python3.
 
 ## License
 

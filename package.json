@@ -1,6 +1,6 @@
 {
   "name": "signalk-ewelink",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "eWeLink/Sonoff devices as native Signal K \u2014 LAN-first, cloud-fallback, push not poll, live power. No MQTT.",
   "main": "index.js",
   "scripts": {

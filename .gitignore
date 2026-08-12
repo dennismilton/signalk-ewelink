@@ -4,3 +4,6 @@ __pycache__/
 data/
 *.tmp
 vendor/
+discovered.json
+_keycache.json
+_tokens.json

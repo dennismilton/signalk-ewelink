@@ -29,9 +29,12 @@ except ImportError:
 
 log = lambda *a: print(*a, file=sys.stderr, flush=True)
 
+_out = threading.Lock()   # emit() runs from LAN, poll, push and confirm threads
 def emit(delta):
-    sys.stdout.write(json.dumps(delta) + "\n")
-    sys.stdout.flush()
+    line = json.dumps(delta)
+    with _out:
+        sys.stdout.write(line + "\n")
+        sys.stdout.flush()
 
 def sk(values):
     """values: [(path, value), ...] -> a Signal K delta on stdout."""
@@ -41,6 +44,18 @@ def sk(values):
 CFG = {}
 DEVICES = {}          # deviceid -> {id,key,kind,base,channels,name}
 KEYS = {}             # deviceid -> devicekey (from keysFile)
+DISCOVERED = os.path.join(os.path.dirname(os.path.abspath(__file__)), "discovered.json")
+KEYCACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_keycache.json")
+KEYS = {}             # deviceid -> devicekey, AUTO-fetched from the cloud + cached
+_disc = {}            # everything the account/network shows, for the config page
+MULTI_UIIDS = {2, 3, 4, 7, 8, 9, 29, 30, 31, 41, 77, 78, 112, 126, 140}  # multi-relay
+
+def write_discovered():
+    try:
+        tmp = DISCOVERED + ".tmp"
+        json.dump(_disc, open(tmp, "w")); os.replace(tmp, DISCOVERED)
+    except Exception as e:
+        log(f"discovered.json write failed: {e}")
 
 def _api_base(region):
     return f"https://{region}-apia.coolkit.{'cn' if region == 'cn' else 'cc'}"
@@ -60,7 +75,8 @@ class CloudAuth:
 
     def __init__(self):
         self.tok = None
-        self.file = CFG.get("oauth", {}).get("tokenFile", "/data/ewelink_tokens.json")
+        self._lock = threading.Lock()   # refresh runs from main + WS + stdin threads
+        self.file = CFG.get("oauth", {}).get("tokenFile") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "_tokens.json")
         try:
             with open(self.file) as f:
                 self.tok = json.load(f)
@@ -74,6 +90,8 @@ class CloudAuth:
         tmp = self.file + ".tmp"
         with open(tmp, "w") as f:
             json.dump(self.tok, f)
+        try: os.chmod(tmp, 0o600)          # tokens are secrets — not world-readable
+        except OSError: pass
         os.replace(tmp, self.file)
 
     @property
@@ -88,17 +106,22 @@ class CloudAuth:
         o = CFG.get("oauth", {})
         if not (self.tok and self.tok.get("rt") and o.get("appId") and o.get("appSecret")):
             return False
-        try:
-            d = _cloud_req(f"{_api_base(self.region)}/v2/user/refresh", body={"rt": self.tok["rt"]})
-        except Exception as e:
-            log(f"token refresh failed: {e}"); return False
-        if d.get("error"):
-            log(f"token refresh error {d.get('error')} {d.get('msg', '')}"); return False
-        now = int(time.time() * 1000)
-        self.tok.update({"at": d["data"]["at"], "rt": d["data"]["rt"],
-                         "atExpiredTime": now + 30 * 86400 * 1000,
-                         "rtExpiredTime": now + 60 * 86400 * 1000})
-        self.save(); log("OAuth tokens refreshed"); return True
+        with self._lock:
+            # a second thread may have refreshed while we waited — eWeLink ROTATES
+            # the refresh token, so re-checking here avoids persisting a stale rt
+            now = int(time.time() * 1000)
+            if now < self.tok.get("atExpiredTime", 0) - self.REFRESH_MARGIN_MS:
+                return True
+            try:
+                d = _cloud_req(f"{_api_base(self.region)}/v2/user/refresh", body={"rt": self.tok["rt"]})
+                if d.get("error"):
+                    log(f"token refresh error {d.get('error')} {d.get('msg', '')}"); return False
+                self.tok.update({"at": d["data"]["at"], "rt": d["data"]["rt"],
+                                 "atExpiredTime": now + 30 * 86400 * 1000,
+                                 "rtExpiredTime": now + 60 * 86400 * 1000})
+            except Exception as e:
+                log(f"token refresh failed: {e}"); return False
+            self.save(); log("OAuth tokens refreshed"); return True
 
     def credentials(self):
         if self.tok and self.tok.get("at"):
@@ -168,7 +191,19 @@ class Bridge:
     def _match(self, info):
         if not info:
             return None
-        cfg = DEVICES.get(_props(info).get("id"))
+        did = _props(info).get("id")
+        # record ANY eWeLink device seen on the LAN for the config page, even one
+        # not yet configured — id + ip is enough to offer it
+        if did:
+            try:
+                addrs = info.parsed_addresses()
+                ip = addrs[0] if addrs else None
+            except Exception:
+                ip = None
+            if ip and _disc.get(did, {}).get("ip") != ip:
+                _disc.setdefault(did, {"name": did}).update(ip=ip, source="lan")
+                write_discovered()
+        cfg = DEVICES.get(did)
         if cfg:
             try:
                 addrs = info.parsed_addresses()
@@ -209,6 +244,11 @@ class Bridge:
                     self._undiscover(did, f"{LAN_MISS_LIMIT} poll misses")
 
     def _lan_state(self, info, cfg):
+        if not cfg.get("key"):
+            if not cfg.get("_warned_nokey"):
+                log(f"{cfg['base']}: no devicekey — LAN disabled for it (cloud only)")
+                cfg["_warned_nokey"] = True
+            return
         props = _props(info)
         try:
             p = decrypt(props, cfg["key"]) if props.get("encrypt") in ("true", True) else {}
@@ -238,6 +278,14 @@ class Bridge:
             sk(vals)
             log(f"{source} {base}: {chans}")
             return
+        if online is False:
+            # a single going offline: null its paths so .state does not read stale
+            emit_paths = [(f"{base}.state", None)]
+            if cfg.get("_meter"):
+                emit_paths += [(f"{base}.power", None), (f"{base}.voltage", None),
+                               (f"{base}.current", None)]
+            sk(emit_paths)
+            return
         vals = []
         if source != "LAN":              # power/V/A: cloud only (LAN freezes them)
             if "power" in p:
@@ -251,14 +299,20 @@ class Bridge:
                 except Exception: pass
         if "switch" in p and (source == "LAN" or not self.lan_active(cfg["id"])):
             vals.append((f"{base}.state", 1 if p["switch"] == "on" else 0))
+        if any(k in (f"{base}.power", f"{base}.voltage", f"{base}.current") for k, _ in vals):
+            cfg["_meter"] = True
         if vals:
             sk(vals)
             log(f"{source} {base}: {dict(vals)}")
 
     # -- control: discovery decides -----------------------------------------
     def control(self, cfg, params):
-        if self.lan_active(cfg["id"]):
-            st = self.lan[cfg["id"]]
+        # try LAN when discovered; a LAN FAILURE now FALLS THROUGH to the cloud
+        # rather than silently losing the command (the discovery race:
+        # lan_active() true, then undiscovered before the request). Reachability
+        # is still preferred, but a dropped switch is never acceptable.
+        st = self.lan.get(cfg["id"]) or {}
+        if st.get("addr"):
             endpoint = "switches" if cfg["kind"] == "multi" else "switch"
             iv_b64, data_b64 = encrypt(params, cfg["key"])
             body = json.dumps({
@@ -270,11 +324,13 @@ class Bridge:
                     f"http://{st['addr']}:{st['port']}/zeroconf/{endpoint}",
                     data=body, headers={"Content-Type": "application/json"})
                 resp = json.loads(urllib.request.urlopen(req, timeout=5).read())
-                log(f"LAN control {cfg['base']} {params} -> {'ok' if resp.get('error') == 0 else resp}")
-                self.lan_poll()
+                if resp.get("error") == 0:
+                    log(f"LAN control {cfg['base']} {params} -> ok")
+                    self.lan_poll()
+                    return
+                log(f"LAN control {cfg['base']} -> {resp}; trying cloud")
             except Exception as e:
-                log(f"LAN control {cfg['base']} FAILED: {e}")
-            return
+                log(f"LAN control {cfg['base']} failed ({e}); trying cloud")
         creds = self.auth.credentials()
         if not creds:
             log("cloud control impossible — no credentials"); return
@@ -305,22 +361,49 @@ class Bridge:
                 return self.cloud_poll(_retry=False)
             log(f"cloud error {d.get('error')} {d.get('msg', '')}"); self._cloud_fail(); return
         seen = False
+        changed = False
         for t in (d.get("data") or {}).get("thingList") or []:
             it = t.get("itemData", {})
+            did = it.get("deviceid")
+            if did:
+                uiid = ((it.get("extra") or {}).get("uiid")
+                        or (it.get("itemType") if isinstance(it.get("itemType"), int) else None))
+                kind = "multi" if uiid in MULTI_UIIDS else "single"
+                pr = it.get("params") or {}
+                chans = len(pr.get("switches") or []) or (4 if kind == "multi" else 1)
+                rec = {"name": it.get("name") or did, "model": it.get("productModel") or "",
+                       "kind": kind, "channels": chans, "online": bool(it.get("online")),
+                       "source": "cloud"}
+                if _disc.get(did) != {**_disc.get(did, {}), **rec}:
+                    _disc[did] = {**_disc.get(did, {}), **rec}; changed = True
             cfg = DEVICES.get(it.get("deviceid"))
             if not cfg:
                 continue
             seen = True
             if it.get("apikey"):
                 self.apikey = it["apikey"]
+            # AUTO-KEY: the cloud hands us every devicekey — fill it in and cache
+            # it (0600) so there is no keys file and LAN works offline thereafter
+            dk = it.get("devicekey")
+            if dk and cfg.get("key") != dk:
+                cfg["key"] = dk
+                KEYS[it["deviceid"]] = dk
+                try:
+                    tmp = KEYCACHE + ".tmp"; json.dump(KEYS, open(tmp, "w"))
+                    os.chmod(tmp, 0o600); os.replace(tmp, KEYCACHE)
+                    log(f"cached devicekey for {cfg['base']}")
+                except Exception as e:
+                    log(f"keycache write failed: {e}")
             if cfg["kind"] == "multi" and self.lan_active(cfg["id"]):
                 continue
             self.publish_state(cfg, it.get("params") or {},
                                online=bool(it.get("online")), source="poll")
+        if changed:
+            write_discovered()
         if seen:
             self.cloud_fails = 0
-        else:
-            self._cloud_fail()
+        # a successful poll that simply contained none of OUR devices is NOT a
+        # transport failure — do not count it toward clearing retained readings
 
     def _cloud_fail(self):
         self.cloud_fails += 1
@@ -430,22 +513,20 @@ class CloudWS:
 def load_config(options):
     global CFG, DEVICES, KEYS
     CFG = options or {}
-    KEYS = {}
-    kf = CFG.get("keysFile")
-    if kf:
-        try:
-            with open(kf) as f:
-                KEYS = json.load(f)
-            log(f"loaded {len(KEYS)} device key(s) from {kf}")
-        except Exception as e:
-            log(f"keys file {kf}: {e}")
+    # devicekeys are AUTO-fetched from the eWeLink cloud (they are in the device
+    # list we already poll) and cached here, so there is no keys file to manage
+    # and LAN keeps working offline after the first cloud sync.
+    try:
+        KEYS = json.load(open(KEYCACHE))
+    except Exception:
+        KEYS = {}
     DEVICES = {}
     for d in CFG.get("devices", []):
         did = (d.get("id") or "").strip()
         if not did:
             continue
         DEVICES[did] = {
-            "id": did, "key": KEYS.get(did, d.get("key", "")),
+            "id": did, "key": KEYS.get(did, ""),
             "kind": d.get("kind", "single"), "base": d.get("basePath", ""),
             "channels": int(d.get("channels", 4)), "name": d.get("name", did)}
 
@@ -457,19 +538,21 @@ def stdin_loop(bridge):
             continue
         try:
             msg = json.loads(line)
-        except ValueError:
-            continue
-        if msg.get("type") != "cmd":
-            continue
-        cfg = DEVICES.get(msg.get("deviceid"))
-        if not cfg:
-            continue
-        on = bool(msg.get("on"))
-        if cfg["kind"] == "multi":
-            ch = int(msg.get("outlet") or 1)
-            bridge.control(cfg, {"switches": [{"switch": "on" if on else "off", "outlet": ch - 1}]})
-        else:
-            bridge.control(cfg, {"switch": "on" if on else "off"})
+            if msg.get("type") != "cmd":
+                continue
+            cfg = DEVICES.get(msg.get("deviceid"))
+            if not cfg:
+                continue
+            on = bool(msg.get("on"))
+            if cfg["kind"] == "multi":
+                ch = int(msg.get("outlet") or 1)
+                bridge.control(cfg, {"switches": [{"switch": "on" if on else "off", "outlet": ch - 1}]})
+            else:
+                bridge.control(cfg, {"switch": "on" if on else "off"})
+        except Exception as e:          # a bad control line must not kill the thread
+            log(f"control line error: {e}")
+    # stdin closed = Signal K is gone → do not orphan a polling worker
+    os._exit(0)
 
 def main():
     # the first stdin line is the config; block for it
@@ -479,16 +562,10 @@ def main():
         load_config(msg.get("options", {}))
     except Exception as e:
         log(f"bad config line: {e}"); return
-    if not DEVICES:
-        log("no devices configured");
-        # idle so index.js does not treat exit as a crash
-        while True:
-            time.sleep(3600)
-
     auth = CloudAuth()
     zc = Zeroconf()
     bridge = Bridge(zc, auth)
-    ServiceBrowser(zc, "_ewelink._tcp.local.", bridge)
+    ServiceBrowser(zc, "_ewelink._tcp.local.", bridge)   # mDNS discovery always on
 
     if auth.credentials():
         log(f"cloud: reconcile every {CFG.get('cloudIntervalS', 60)}s + push")
