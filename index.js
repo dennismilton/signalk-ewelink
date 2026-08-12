@@ -96,10 +96,13 @@ module.exports = function (app) {
   }
 
   let stopping = false
+  let gen = 0
   const lastErr = []                     // ring buffer of recent stderr, for exit reporting
 
   const spawnChild = (options) => {
     const pyBin = (options && options.pythonPath) || 'python3'
+    if (child) { try { child.kill() } catch (e) {} }     // never leak a prior worker
+    const myGen = ++gen
     child = spawn(pyBin, ['-u', path.join(__dirname, 'plugin.py')], { cwd: __dirname })
     child.stdin.on('error', (e) => app.error('plugin.py stdin: ' + e.message))
 
@@ -124,11 +127,12 @@ module.exports = function (app) {
     })
     child.on('error', (e) => app.error('plugin.py spawn error: ' + e.message))
     child.on('exit', (code) => {
-      if (stopping) return
+      // stopping = intentional; myGen !== gen = a newer child already replaced
+      // this one (a normal Signal K restart on config save). Neither is a crash.
+      if (stopping || myGen !== gen) return
       app.error('plugin.py exited (' + code + '): ' + lastErr.join(' | '))
       app.setPluginError && app.setPluginError('plugin.py exited ' + code)
-      // respawn with a fixed backoff — never a tight restart loop
-      setTimeout(() => { if (!stopping) { spawnChild(options); send({ type: 'config', options }) } }, 5000)
+      setTimeout(() => { if (!stopping && myGen === gen) { spawnChild(options); send({ type: 'config', options }) } }, 5000)
     })
     send({ type: 'config', options })
   }
