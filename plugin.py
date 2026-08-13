@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""signalk-ewelink plugin worker. Same bridge that ran on the boat as
-maracaibo-sonoff, with the MQTT tail replaced by the Signal K plugin contract:
+"""signalk-ewelink plugin worker — the eWeLink bridge behind the Signal K
+plugin contract:
 
   • config arrives as ONE json line on stdin: {"type":"config","options":{...}}
   • control arrives as further stdin lines:   {"type":"cmd","deviceid","outlet","on"}
@@ -12,7 +12,7 @@ device on this network, LAN owns its state and control; otherwise the cloud
 does. Discovery can UNDISCOVER. State is pushed (mDNS + eWeLink WebSocket); a
 slow poll reconciles and fetches power/V/A; a uiActive nudge streams live power.
 """
-import sys, os, json, time, hashlib, hmac, base64, secrets, threading
+import sys, os, json, time, hashlib, hmac, base64, secrets, shutil, threading
 import urllib.request, urllib.parse
 # vendored deps live beside this file (pip install --target vendor/), so the
 # plugin carries pycryptodome/zeroconf/websocket-client and survives a Signal K
@@ -29,6 +29,45 @@ except ImportError:
 
 log = lambda *a: print(*a, file=sys.stderr, flush=True)
 
+_HERE = os.path.dirname(os.path.abspath(__file__))
+
+def _data_dir():
+    """Where tokens, the devicekey cache and the discovery list live.
+
+    index.js passes the Signal K plugin data directory in the environment. That
+    directory is OUTSIDE the plugin install, so a reinstall or an appstore
+    upgrade does NOT wipe the OAuth tokens — writing them beside plugin.py meant
+    re-authorising after every update. Only if the server gave us nothing (or it
+    is not writable) do we fall back to the old location.
+    """
+    d = os.environ.get("SIGNALK_EWELINK_DATA")
+    if d:
+        try:
+            os.makedirs(d, exist_ok=True)
+            probe = os.path.join(d, ".writetest")
+            with open(probe, "w") as f:
+                f.write("")
+            os.remove(probe)
+            return d
+        except OSError as e:
+            log(f"data dir {d} not usable ({e}) — falling back beside the plugin")
+    return _HERE
+
+DATA_DIR = _data_dir()
+
+def _migrate(name):
+    """Carry a pre-1.0.4 file from beside the plugin into the data dir once."""
+    new = os.path.join(DATA_DIR, name)
+    old = os.path.join(_HERE, name)
+    if DATA_DIR != _HERE and os.path.exists(old) and not os.path.exists(new):
+        try:
+            shutil.copyfile(old, new)
+            os.chmod(new, 0o600)
+            log(f"migrated {name} into {DATA_DIR}")
+        except OSError as e:
+            log(f"could not migrate {name}: {e}")
+    return new
+
 _out = threading.Lock()   # emit() runs from LAN, poll, push and confirm threads
 def emit(delta):
     line = json.dumps(delta)
@@ -43,19 +82,30 @@ def sk(values):
 # ── config (filled from the stdin config line) ───────────────────────────────
 CFG = {}
 DEVICES = {}          # deviceid -> {id,key,kind,base,channels,name}
-KEYS = {}             # deviceid -> devicekey (from keysFile)
-DISCOVERED = os.path.join(os.path.dirname(os.path.abspath(__file__)), "discovered.json")
-KEYCACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_keycache.json")
 KEYS = {}             # deviceid -> devicekey, AUTO-fetched from the cloud + cached
+DISCOVERED = _migrate("discovered.json")   # device list for the config dropdown
+KEYCACHE = _migrate("_keycache.json")      # devicekeys, so LAN works offline
+TOKENS = _migrate("_tokens.json")          # OAuth access/refresh tokens
 _disc = {}            # everything the account/network shows, for the config page
 MULTI_UIIDS = {2, 3, 4, 7, 8, 9, 29, 30, 31, 41, 77, 78, 112, 126, 140}  # multi-relay
+
+def status(text):
+    """Tell index.js what to show in the admin UI's plugin status line."""
+    emit({"type": "status", "message": text})
 
 def write_discovered():
     try:
         tmp = DISCOVERED + ".tmp"
-        json.dump(_disc, open(tmp, "w")); os.replace(tmp, DISCOVERED)
-    except Exception as e:
+        with open(tmp, "w") as f:
+            json.dump(_disc, f)
+        os.replace(tmp, DISCOVERED)
+    except OSError as e:
         log(f"discovered.json write failed: {e}")
+
+# eWeLink demands the redirect target match the one registered against the app
+# at dev.ewelink.cc. The Signal K server's own address is the useful default:
+# the browser lands back on it with ?code=… in the address bar, ready to copy.
+DEFAULT_REDIRECT = "http://localhost:3000/"
 
 def _api_base(region):
     return f"https://{region}-apia.coolkit.{'cn' if region == 'cn' else 'cc'}"
@@ -76,23 +126,82 @@ class CloudAuth:
     def __init__(self):
         self.tok = None
         self._lock = threading.Lock()   # refresh runs from main + WS + stdin threads
-        self.file = CFG.get("oauth", {}).get("tokenFile") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "_tokens.json")
+        # default is the Signal K plugin data dir (see _data_dir): tokens must
+        # outlive a plugin reinstall. tokenFile overrides it for odd setups.
+        self.file = CFG.get("oauth", {}).get("tokenFile") or TOKENS
         try:
             with open(self.file) as f:
                 self.tok = json.load(f)
             log(f"loaded OAuth tokens from {self.file}")
         except FileNotFoundError:
-            pass
-        except Exception as e:
-            log(f"token file {self.file} unreadable: {e}")
+            pass                        # first run — authorise() will create it
+        except (OSError, ValueError) as e:
+            log(f"token file {self.file} unreadable ({e}) — ignoring it")
 
     def save(self):
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(self.file)), exist_ok=True)
+        except OSError:
+            pass
         tmp = self.file + ".tmp"
         with open(tmp, "w") as f:
             json.dump(self.tok, f)
         try: os.chmod(tmp, 0o600)          # tokens are secrets — not world-readable
         except OSError: pass
         os.replace(tmp, self.file)
+
+    # -- one-time authorisation -------------------------------------------
+    # eWeLink OAuth2.0 is a browser redirect flow, so it cannot run headless:
+    # the user visits login_url() once, is bounced to their redirect URL with
+    # ?code=… on it, and pastes that code into the plugin config. We trade it
+    # for tokens ONCE and persist them; from then on refresh() keeps them alive
+    # and the code is never needed again.
+
+    def login_url(self):
+        o = CFG.get("oauth", {})
+        appid, secret = o.get("appId", ""), o.get("appSecret", "")
+        if not (appid and secret):
+            return None
+        seq = str(int(time.time() * 1000))
+        sign = base64.b64encode(hmac.new(secret.encode(), f"{appid}_{seq}".encode(),
+                                         hashlib.sha256).digest()).decode()
+        return "https://c2ccdn.coolkit.cc/oauth/index.html?" + urllib.parse.urlencode({
+            "clientId": appid, "seq": seq, "authorization": sign,
+            "redirectUrl": o.get("redirectUrl") or DEFAULT_REDIRECT,
+            "nonce": secrets.token_hex(4), "grantType": "authorization_code",
+            "state": "signalk"})
+
+    def exchange(self, code):
+        o = CFG.get("oauth", {})
+        region = o.get("region", "eu")
+        try:
+            d = _cloud_req(f"{_api_base(region)}/v2/user/oauth/token", body={
+                "clientId": o.get("appId", ""), "clientSecret": o.get("appSecret", ""),
+                "grantType": "authorization_code", "code": code,
+                "redirectUrl": o.get("redirectUrl") or DEFAULT_REDIRECT})
+        except Exception as e:
+            log(f"OAuth code exchange failed: {e}")
+            return False
+        if d.get("error"):
+            log(f"OAuth code exchange refused ({d.get('error')} {d.get('msg', '')}) — "
+                "an authorisation code is single-use and expires within minutes, "
+                "and the Redirect URL must match the one registered at dev.ewelink.cc")
+            return False
+        data = d.get("data") or {}
+        now = int(time.time() * 1000)
+        if not data.get("accessToken"):
+            log("OAuth code exchange returned no access token")
+            return False
+        self.tok = {"at": data["accessToken"], "rt": data.get("refreshToken"),
+                    "atExpiredTime": data.get("atExpiredTime") or now + 30 * 86400 * 1000,
+                    "rtExpiredTime": data.get("rtExpiredTime") or now + 60 * 86400 * 1000,
+                    "region": region}
+        try:
+            self.save()
+        except OSError as e:
+            log(f"could not persist tokens to {self.file}: {e}")
+        log(f"OAuth authorised — tokens saved to {self.file}")
+        return True
 
     @property
     def region(self):
@@ -389,10 +498,12 @@ class Bridge:
                 cfg["key"] = dk
                 KEYS[it["deviceid"]] = dk
                 try:
-                    tmp = KEYCACHE + ".tmp"; json.dump(KEYS, open(tmp, "w"))
+                    tmp = KEYCACHE + ".tmp"
+                    with open(tmp, "w") as f:
+                        json.dump(KEYS, f)
                     os.chmod(tmp, 0o600); os.replace(tmp, KEYCACHE)
                     log(f"cached devicekey for {cfg['base']}")
-                except Exception as e:
+                except OSError as e:
                     log(f"keycache write failed: {e}")
             if cfg["kind"] == "multi" and self.lan_active(cfg["id"]):
                 continue
@@ -515,20 +626,31 @@ def load_config(options):
     CFG = options or {}
     # devicekeys are AUTO-fetched from the eWeLink cloud (they are in the device
     # list we already poll) and cached here, so there is no keys file to manage
-    # and LAN keeps working offline after the first cloud sync.
+    # and LAN keeps working offline after the first cloud sync. On a fresh
+    # install the cache simply is not there yet — that is normal, not an error,
+    # and it refills itself from the next cloud thinglist.
+    KEYS = {}
     try:
-        KEYS = json.load(open(KEYCACHE))
-    except Exception:
+        with open(KEYCACHE) as f:
+            KEYS = json.load(f)
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError) as e:
+        log(f"devicekey cache {KEYCACHE} unreadable ({e}) — refetching from the cloud")
+    if not isinstance(KEYS, dict):
+        log("devicekey cache malformed — refetching from the cloud")
         KEYS = {}
     DEVICES = {}
-    for d in CFG.get("devices", []):
+    for d in CFG.get("devices", []) or []:
         did = (d.get("id") or "").strip()
-        if not did:
+        base = (d.get("basePath") or "").strip()
+        if not did or not base:
+            log("ignoring a device entry with no device or no Signal K path")
             continue
         DEVICES[did] = {
             "id": did, "key": KEYS.get(did, ""),
-            "kind": d.get("kind", "single"), "base": d.get("basePath", ""),
-            "channels": int(d.get("channels", 4)), "name": d.get("name", did)}
+            "kind": d.get("kind", "single"), "base": base,
+            "channels": int(d.get("channels") or 4), "name": d.get("name", did)}
 
 def stdin_loop(bridge):
     """Every stdin line after config is a control command from index.js."""
@@ -562,7 +684,27 @@ def main():
         load_config(msg.get("options", {}))
     except Exception as e:
         log(f"bad config line: {e}"); return
+    log(f"state directory: {DATA_DIR}")
     auth = CloudAuth()
+    o = CFG.get("oauth", {})
+
+    # A FRESH INSTALL HAS NOTHING. Say exactly what is missing rather than
+    # failing silently — the plugin stays up either way, it just has less to do.
+    code = (o.get("code") or "").strip()
+    if code and not auth.credentials():
+        auth.exchange(code)
+    if not (o.get("appId") and o.get("appSecret")):
+        status("No eWeLink credentials — enter App ID and App secret (dev.ewelink.cc) in the plugin config")
+        log("no appId/appSecret configured — cloud disabled. Create an app at "
+            "dev.ewelink.cc and enter its App ID and App secret in the plugin config.")
+    elif not auth.credentials():
+        url = auth.login_url()
+        status("Not authorised — open the eWeLink login URL from the server log, then paste the code into the config")
+        log("appId/appSecret set but NOT AUTHORISED YET. Open this URL in a browser, "
+            "log in to eWeLink, then copy the ?code=… value off the address bar you "
+            "land on and paste it into the plugin config's 'Authorisation code' field:")
+        log(url or "(cannot build the login URL without appId and appSecret)")
+
     zc = Zeroconf()
     bridge = Bridge(zc, auth)
     ServiceBrowser(zc, "_ewelink._tcp.local.", bridge)   # mDNS discovery always on
@@ -571,6 +713,10 @@ def main():
         log(f"cloud: reconcile every {CFG.get('cloudIntervalS', 60)}s + push")
         bridge.cloud_poll()
         CloudWS(auth, bridge).start()
+        if not DEVICES:
+            status("Connected — now pick your devices in the plugin config")
+        else:
+            status(f"{len(DEVICES)} device(s), LAN-first")
     else:
         log("no cloud credentials — LAN-discovered devices only")
 
