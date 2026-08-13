@@ -1,9 +1,21 @@
+# dependencies / build artefacts
 node_modules/
+vendor/
 __pycache__/
 *.pyc
-data/
+*.tgz
 *.tmp
-vendor/
+
+# runtime state and secrets — never commit these
+data/
+.env
+.env.*
+*.log
 discovered.json
 _keycache.json
 _tokens.json
+_tokens.json.tmp
+ewelink_keys.json
+ewelink_tokens.json
+keys.json
+tokens.json
