@@ -31,9 +31,11 @@ hardware, configured entirely in the Signal K admin UI.
   (`pycryptodome`, `zeroconf`, `websocket-client`). See [Python deps](#python-deps).
 - For LAN control, the Signal K host must share a network with the devices —
   mDNS does not cross subnets, so a container needs **host networking**.
-- An eWeLink account, and an OAuth app from [dev.ewelink.cc](https://dev.ewelink.cc)
-  (free). Cloud access is what supplies the device list and the per-device LAN
-  keys, so it is needed at least once even for a LAN-only setup.
+- **A free eWeLink _developer_ account** — this is required, and it is *not* your
+  eWeLink phone-app login. You register at [dev.ewelink.cc](https://dev.ewelink.cc)
+  and create an app to get an **App ID** and **App secret**. It is needed even for
+  a LAN-only setup, because the cloud supplies the device list and the per-device
+  LAN keys once. See the [Configure](#configure-signal-k-admin-ui) section.
 
 ## Install
 
