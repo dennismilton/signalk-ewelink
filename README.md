@@ -57,16 +57,19 @@ the Signal K server runs:
 python3 -m pip install -r requirements.txt
 ```
 
-On modern Debian/Raspberry Pi OS that needs a venv or
-`pip install --break-system-packages`. Alternatively, vendor them inside the
-plugin directory, which keeps the plugin self-contained:
+On modern Debian/Raspberry Pi OS (and the official Docker image, which is
+Ubuntu-based) `pip` is "externally managed", so either add
+`--break-system-packages`, use a venv, or vendor the deps inside the plugin
+directory (self-contained, and it survives across the plugin's own reinstalls
+only if you re-run it):
 
 ```sh
 cd ~/.signalk/node_modules/signalk-ewelink
 python3 -m pip install --target vendor/ -r requirements.txt
 ```
 
-Note that the official Signal K docker image ships **without** python3.
+The official Signal K Docker image already includes `python3` and `pip3` (it is
+built on Ubuntu) — you only need to install these deps, not a custom image.
 
 ## Configure (Signal K admin UI)
 
