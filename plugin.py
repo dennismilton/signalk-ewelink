@@ -2,21 +2,20 @@
 """signalk-ewelink plugin worker — the eWeLink bridge behind the Signal K
 plugin contract:
 
-  • config arrives as ONE json line on stdin: {"type":"config","options":{...}}
-  • control arrives as further stdin lines:   {"type":"cmd","deviceid","outlet","on"}
-  • device state leaves as Signal K DELTAS on stdout, one json object per line —
-    index.js pipes each straight into app.handleMessage. No MQTT, no broker.
+  • config in:  one json line on stdin, {"type":"config","options":{...}}
+  • control in: further stdin lines,    {"type":"cmd","deviceid","outlet","on"}
+  • state out:  Signal K deltas on stdout, one json object per line, which
+    index.js pipes straight into app.handleMessage. No MQTT, no broker.
 
-THE CONTRACT is unchanged from the standalone bridge: if mDNS has discovered a
-device on this network, LAN owns its state and control; otherwise the cloud
-does. Discovery can UNDISCOVER. State is pushed (mDNS + eWeLink WebSocket); a
-slow poll reconciles and fetches power/V/A; a uiActive nudge streams live power.
+If mDNS has discovered a device on this network, LAN owns its state and
+control; otherwise the cloud does. Discovery can UNDISCOVER. State is pushed
+(mDNS + eWeLink WebSocket); a slow poll reconciles and fetches power/V/A; a
+uiActive nudge streams live power.
 """
 import sys, os, json, time, hashlib, hmac, base64, secrets, shutil, threading
 import urllib.request, urllib.parse
-# vendored deps live beside this file (pip install --target vendor/), so the
-# plugin carries pycryptodome/zeroconf/websocket-client and survives a Signal K
-# container recreation without touching the image.
+# vendored deps beside this file (pip install --target vendor/) so the plugin
+# survives a Signal K container recreation without touching the image
 _vendor = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor")
 if os.path.isdir(_vendor):
     sys.path.insert(0, _vendor)
@@ -32,14 +31,9 @@ log = lambda *a: print(*a, file=sys.stderr, flush=True)
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
 def _data_dir():
-    """Where tokens, the devicekey cache and the discovery list live.
-
-    index.js passes the Signal K plugin data directory in the environment. That
-    directory is OUTSIDE the plugin install, so a reinstall or an appstore
-    upgrade does NOT wipe the OAuth tokens — writing them beside plugin.py meant
-    re-authorising after every update. Only if the server gave us nothing (or it
-    is not writable) do we fall back to the old location.
-    """
+    # index.js passes the Signal K plugin data dir, which is OUTSIDE the plugin
+    # install — writing tokens beside plugin.py meant re-authorising after every
+    # upgrade. Fall back to the old location only if that dir is unusable.
     d = os.environ.get("SIGNALK_EWELINK_DATA")
     if d:
         try:
@@ -68,15 +62,32 @@ def _migrate(name):
             log(f"could not migrate {name}: {e}")
     return new
 
-_out = threading.Lock()   # emit() runs from LAN, poll, push and confirm threads
+def _write_json(path, obj, mode=None):
+    """Atomic json write. Returns False (and logs) instead of raising."""
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            json.dump(obj, f)
+        if mode:
+            os.chmod(tmp, mode)
+        os.replace(tmp, path)
+        return True
+    except OSError as e:
+        log(f"{os.path.basename(path)} write failed: {e}")
+        return False
+
+_out = threading.Lock()   # emit() runs from LAN, poll, push and stdin threads
 def emit(delta):
     line = json.dumps(delta)
     with _out:
-        sys.stdout.write(line + "\n")
-        sys.stdout.flush()
+        try:
+            sys.stdout.write(line + "\n")
+            sys.stdout.flush()
+        except (BrokenPipeError, ValueError):
+            os._exit(0)   # Signal K is gone — same contract as stdin EOF
 
 def sk(values):
-    """values: [(path, value), ...] -> a Signal K delta on stdout."""
+    """[(path, value), ...] -> one Signal K delta on stdout."""
     emit({"updates": [{"values": [{"path": p, "value": v} for p, v in values]}]})
 
 # ── config (filled from the stdin config line) ───────────────────────────────
@@ -90,21 +101,13 @@ _disc = {}            # everything the account/network shows, for the config pag
 MULTI_UIIDS = {2, 3, 4, 7, 8, 9, 29, 30, 31, 41, 77, 78, 112, 126, 140}  # multi-relay
 
 def status(text):
-    """Tell index.js what to show in the admin UI's plugin status line."""
     emit({"type": "status", "message": text})
 
 def write_discovered():
-    try:
-        tmp = DISCOVERED + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(_disc, f)
-        os.replace(tmp, DISCOVERED)
-    except OSError as e:
-        log(f"discovered.json write failed: {e}")
+    _write_json(DISCOVERED, _disc)
 
 # eWeLink demands the redirect target match the one registered against the app
-# at dev.ewelink.cc. The Signal K server's own address is the useful default:
-# the browser lands back on it with ?code=… in the address bar, ready to copy.
+# at dev.ewelink.cc; the Signal K server's own address is the useful default.
 DEFAULT_REDIRECT = "http://localhost:3000/"
 
 def _api_base(region):
@@ -118,7 +121,8 @@ def _cloud_req(url, body=None, bearer=None, appid=None):
     req = urllib.request.Request(url, data=data, headers={
         "Content-Type": "application/json", "X-CK-Appid": appid or CFG.get("oauth", {}).get("appId", ""),
         "X-CK-Nonce": secrets.token_hex(4), "Authorization": auth})
-    return json.load(urllib.request.urlopen(req, timeout=10))
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return json.load(r)
 
 class CloudAuth:
     REFRESH_MARGIN_MS = 24 * 3600 * 1000
@@ -126,8 +130,6 @@ class CloudAuth:
     def __init__(self):
         self.tok = None
         self._lock = threading.Lock()   # refresh runs from main + WS + stdin threads
-        # default is the Signal K plugin data dir (see _data_dir): tokens must
-        # outlive a plugin reinstall. tokenFile overrides it for odd setups.
         self.file = CFG.get("oauth", {}).get("tokenFile") or TOKENS
         try:
             with open(self.file) as f:
@@ -143,19 +145,11 @@ class CloudAuth:
             os.makedirs(os.path.dirname(os.path.abspath(self.file)), exist_ok=True)
         except OSError:
             pass
-        tmp = self.file + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(self.tok, f)
-        try: os.chmod(tmp, 0o600)          # tokens are secrets — not world-readable
-        except OSError: pass
-        os.replace(tmp, self.file)
+        return _write_json(self.file, self.tok, 0o600)   # tokens are secrets
 
-    # -- one-time authorisation -------------------------------------------
     # eWeLink OAuth2.0 is a browser redirect flow, so it cannot run headless:
-    # the user visits login_url() once, is bounced to their redirect URL with
-    # ?code=… on it, and pastes that code into the plugin config. We trade it
-    # for tokens ONCE and persist them; from then on refresh() keeps them alive
-    # and the code is never needed again.
+    # the user visits login_url() once and pastes the ?code=… back into the
+    # config. We trade it for tokens ONCE; refresh() keeps them alive after that.
 
     def login_url(self):
         o = CFG.get("oauth", {})
@@ -179,7 +173,7 @@ class CloudAuth:
                 "clientId": o.get("appId", ""), "clientSecret": o.get("appSecret", ""),
                 "grantType": "authorization_code", "code": code,
                 "redirectUrl": o.get("redirectUrl") or DEFAULT_REDIRECT})
-        except Exception as e:
+        except (OSError, ValueError) as e:
             log(f"OAuth code exchange failed: {e}")
             return False
         if d.get("error"):
@@ -188,18 +182,15 @@ class CloudAuth:
                 "and the Redirect URL must match the one registered at dev.ewelink.cc")
             return False
         data = d.get("data") or {}
-        now = int(time.time() * 1000)
         if not data.get("accessToken"):
             log("OAuth code exchange returned no access token")
             return False
+        now = int(time.time() * 1000)
         self.tok = {"at": data["accessToken"], "rt": data.get("refreshToken"),
                     "atExpiredTime": data.get("atExpiredTime") or now + 30 * 86400 * 1000,
                     "rtExpiredTime": data.get("rtExpiredTime") or now + 60 * 86400 * 1000,
                     "region": region}
-        try:
-            self.save()
-        except OSError as e:
-            log(f"could not persist tokens to {self.file}: {e}")
+        self.save()
         log(f"OAuth authorised — tokens saved to {self.file}")
         return True
 
@@ -216,8 +207,8 @@ class CloudAuth:
         if not (self.tok and self.tok.get("rt") and o.get("appId") and o.get("appSecret")):
             return False
         with self._lock:
-            # a second thread may have refreshed while we waited — eWeLink ROTATES
-            # the refresh token, so re-checking here avoids persisting a stale rt
+            # eWeLink ROTATES the refresh token, so re-check under the lock: a
+            # second thread may already have refreshed and ours would be stale
             now = int(time.time() * 1000)
             if now < self.tok.get("atExpiredTime", 0) - self.REFRESH_MARGIN_MS:
                 return True
@@ -228,7 +219,7 @@ class CloudAuth:
                 self.tok.update({"at": d["data"]["at"], "rt": d["data"]["rt"],
                                  "atExpiredTime": now + 30 * 86400 * 1000,
                                  "rtExpiredTime": now + 60 * 86400 * 1000})
-            except Exception as e:
+            except (OSError, ValueError, KeyError, TypeError) as e:
                 log(f"token refresh failed: {e}"); return False
             self.save(); log("OAuth tokens refreshed"); return True
 
@@ -270,7 +261,7 @@ def _props(info):
     for k, v in (info.properties or {}).items():
         try:
             out[k.decode()] = v.decode() if isinstance(v, bytes) else v
-        except Exception:
+        except (UnicodeDecodeError, AttributeError):
             pass
     return out
 
@@ -289,7 +280,7 @@ class Bridge:
         self.last = {}
 
     def lan_active(self, did):
-        return bool(self.lan[did]["addr"]) if did in self.lan else False
+        return bool(self.lan.get(did, {}).get("addr"))
 
     def _undiscover(self, did, why):
         st = self.lan[did]
@@ -301,25 +292,18 @@ class Bridge:
         if not info:
             return None
         did = _props(info).get("id")
+        try:
+            addrs = info.parsed_addresses()
+        except Exception:
+            addrs = []
         # record ANY eWeLink device seen on the LAN for the config page, even one
         # not yet configured — id + ip is enough to offer it
-        if did:
-            try:
-                addrs = info.parsed_addresses()
-                ip = addrs[0] if addrs else None
-            except Exception:
-                ip = None
-            if ip and _disc.get(did, {}).get("ip") != ip:
-                _disc.setdefault(did, {"name": did}).update(ip=ip, source="lan")
-                write_discovered()
+        if did and addrs and _disc.get(did, {}).get("ip") != addrs[0]:
+            _disc.setdefault(did, {"name": did}).update(ip=addrs[0], source="lan")
+            write_discovered()
         cfg = DEVICES.get(did)
-        if cfg:
-            try:
-                addrs = info.parsed_addresses()
-                if addrs:
-                    self.lan[cfg["id"]].update(addr=addrs[0], port=info.port, miss=0)
-            except Exception:
-                pass
+        if cfg and addrs:
+            self.lan[cfg["id"]].update(addr=addrs[0], port=info.port, miss=0)
         return cfg
 
     def add_service(self, zc, type_, name):    self._seen(name)
@@ -361,7 +345,7 @@ class Bridge:
         props = _props(info)
         try:
             p = decrypt(props, cfg["key"]) if props.get("encrypt") in ("true", True) else {}
-        except Exception as e:
+        except Exception as e:      # any malformed packet is skipped, never fatal
             log(f"decrypt failed: {e}"); return
         self.publish_state(cfg, p, online=True, source="LAN")
 
@@ -388,38 +372,34 @@ class Bridge:
             log(f"{source} {base}: {chans}")
             return
         if online is False:
-            # a single going offline: null its paths so .state does not read stale
-            emit_paths = [(f"{base}.state", None)]
+            # null the paths so .state does not read stale after a device drops
+            vals = [(f"{base}.state", None)]
             if cfg.get("_meter"):
-                emit_paths += [(f"{base}.power", None), (f"{base}.voltage", None),
-                               (f"{base}.current", None)]
-            sk(emit_paths)
+                vals += [(f"{base}.power", None), (f"{base}.voltage", None),
+                         (f"{base}.current", None)]
+            sk(vals)
             return
         vals = []
-        if source != "LAN":              # power/V/A: cloud only (LAN freezes them)
-            if "power" in p:
-                try: vals.append((f"{base}.power", float(p["power"])));
-                except Exception: pass
-            if "voltage" in p:
-                try: vals.append((f"{base}.voltage", float(p["voltage"])))
-                except Exception: pass
-            if "current" in p:
-                try: vals.append((f"{base}.current", float(p["current"])))
-                except Exception: pass
+        if source != "LAN":              # power/V/A freeze on LAN, so cloud only
+            for k in ("power", "voltage", "current"):
+                if k in p:
+                    try:
+                        vals.append((f"{base}.{k}", float(p[k])))
+                    except (TypeError, ValueError):
+                        pass
+            if vals:
+                cfg["_meter"] = True
         if "switch" in p and (source == "LAN" or not self.lan_active(cfg["id"])):
             vals.append((f"{base}.state", 1 if p["switch"] == "on" else 0))
-        if any(k in (f"{base}.power", f"{base}.voltage", f"{base}.current") for k, _ in vals):
-            cfg["_meter"] = True
         if vals:
             sk(vals)
             log(f"{source} {base}: {dict(vals)}")
 
     # -- control: discovery decides -----------------------------------------
     def control(self, cfg, params):
-        # try LAN when discovered; a LAN FAILURE now FALLS THROUGH to the cloud
-        # rather than silently losing the command (the discovery race:
-        # lan_active() true, then undiscovered before the request). Reachability
-        # is still preferred, but a dropped switch is never acceptable.
+        # LAN when discovered, but a LAN FAILURE FALLS THROUGH to the cloud
+        # rather than losing the command (the discovery race: lan_active() true,
+        # then undiscovered before the request). A dropped switch is never ok.
         st = self.lan.get(cfg["id"]) or {}
         if st.get("addr"):
             endpoint = "switches" if cfg["kind"] == "multi" else "switch"
@@ -432,13 +412,14 @@ class Bridge:
                 req = urllib.request.Request(
                     f"http://{st['addr']}:{st['port']}/zeroconf/{endpoint}",
                     data=body, headers={"Content-Type": "application/json"})
-                resp = json.loads(urllib.request.urlopen(req, timeout=5).read())
+                with urllib.request.urlopen(req, timeout=5) as r:
+                    resp = json.loads(r.read())
                 if resp.get("error") == 0:
                     log(f"LAN control {cfg['base']} {params} -> ok")
                     self.lan_poll()
                     return
                 log(f"LAN control {cfg['base']} -> {resp}; trying cloud")
-            except Exception as e:
+            except (OSError, ValueError) as e:
                 log(f"LAN control {cfg['base']} failed ({e}); trying cloud")
         creds = self.auth.credentials()
         if not creds:
@@ -452,7 +433,7 @@ class Bridge:
             log(f"cloud control {cfg['base']} {params} -> {'ok' if ok else (d.get('error'), d.get('msg', ''))}")
             if ok:
                 self.cloud_poll()
-        except Exception as e:
+        except (OSError, ValueError) as e:
             log(f"cloud control {cfg['base']} FAILED: {e}")
 
     # -- cloud reconcile poll -----------------------------------------------
@@ -463,14 +444,13 @@ class Bridge:
         at, appid, region = creds
         try:
             d = _cloud_req(f"{_api_base(region)}/v2/device/thing", bearer=at, appid=appid)
-        except Exception as e:
+        except (OSError, ValueError) as e:
             log(f"cloud poll failed: {e}"); self._cloud_fail(); return
         if d.get("error"):
             if d["error"] in (401, 402) and _retry and self.auth.invalidate():
                 return self.cloud_poll(_retry=False)
             log(f"cloud error {d.get('error')} {d.get('msg', '')}"); self._cloud_fail(); return
-        seen = False
-        changed = False
+        seen = changed = False
         for t in (d.get("data") or {}).get("thingList") or []:
             it = t.get("itemData", {})
             did = it.get("deviceid")
@@ -480,12 +460,13 @@ class Bridge:
                 kind = "multi" if uiid in MULTI_UIIDS else "single"
                 pr = it.get("params") or {}
                 chans = len(pr.get("switches") or []) or (4 if kind == "multi" else 1)
-                rec = {"name": it.get("name") or did, "model": it.get("productModel") or "",
+                rec = {**_disc.get(did, {}),
+                       "name": it.get("name") or did, "model": it.get("productModel") or "",
                        "kind": kind, "channels": chans, "online": bool(it.get("online")),
                        "source": "cloud"}
-                if _disc.get(did) != {**_disc.get(did, {}), **rec}:
-                    _disc[did] = {**_disc.get(did, {}), **rec}; changed = True
-            cfg = DEVICES.get(it.get("deviceid"))
+                if _disc.get(did) != rec:
+                    _disc[did] = rec; changed = True
+            cfg = DEVICES.get(did)
             if not cfg:
                 continue
             seen = True
@@ -496,25 +477,19 @@ class Bridge:
             dk = it.get("devicekey")
             if dk and cfg.get("key") != dk:
                 cfg["key"] = dk
-                KEYS[it["deviceid"]] = dk
-                try:
-                    tmp = KEYCACHE + ".tmp"
-                    with open(tmp, "w") as f:
-                        json.dump(KEYS, f)
-                    os.chmod(tmp, 0o600); os.replace(tmp, KEYCACHE)
+                KEYS[did] = dk
+                if _write_json(KEYCACHE, KEYS, 0o600):
                     log(f"cached devicekey for {cfg['base']}")
-                except OSError as e:
-                    log(f"keycache write failed: {e}")
             if cfg["kind"] == "multi" and self.lan_active(cfg["id"]):
                 continue
             self.publish_state(cfg, it.get("params") or {},
                                online=bool(it.get("online")), source="poll")
         if changed:
             write_discovered()
-        if seen:
-            self.cloud_fails = 0
         # a successful poll that simply contained none of OUR devices is NOT a
         # transport failure — do not count it toward clearing retained readings
+        if seen:
+            self.cloud_fails = 0
 
     def _cloud_fail(self):
         self.cloud_fails += 1
@@ -548,13 +523,17 @@ class CloudWS:
         if not d.get("domain"):
             return None
         ws = websocket.create_connection(f"wss://{d['domain']}:{d['port']}/api/ws", timeout=15)
-        ws.send(json.dumps({
-            "action": "userOnline", "at": at, "apikey": self.bridge.apikey or "",
-            "appid": appid, "nonce": secrets.token_hex(4), "ts": int(time.time()),
-            "userAgent": "app", "sequence": str(int(time.time() * 1000)), "version": 8}))
-        hello = json.loads(ws.recv())
-        if hello.get("error") not in (0, None):
-            ws.close(); raise OSError(f"handshake refused: {hello.get('error')}")
+        try:
+            ws.send(json.dumps({
+                "action": "userOnline", "at": at, "apikey": self.bridge.apikey or "",
+                "appid": appid, "nonce": secrets.token_hex(4), "ts": int(time.time()),
+                "userAgent": "app", "sequence": str(int(time.time() * 1000)), "version": 8}))
+            hello = json.loads(ws.recv())
+            if hello.get("error") not in (0, None):
+                raise OSError(f"handshake refused: {hello.get('error')}")
+        except Exception:
+            ws.close()      # never leak the socket on a half-open handshake
+            raise
         hb = int((hello.get("config") or {}).get("hbInterval", 90))
         log(f"cloud push connected (hb {hb}s)")
         return ws, hb
@@ -573,12 +552,13 @@ class CloudWS:
         ui = int(CFG.get("uiActiveS", 110))
         while True:
             ws = None
+            up = 0.0
             try:
                 got = self._connect()
                 if not got:
                     time.sleep(60); continue
                 ws, hb = got
-                backoff = 5
+                up = time.time()
                 ws.settimeout(20)
                 last_ping = last_nudge = 0.0
                 while True:
@@ -600,10 +580,13 @@ class CloudWS:
                     self._handle(msg)
             except Exception as e:
                 log(f"cloud push dropped: {e}")
-                try:
-                    if ws: ws.close()
-                except Exception:
-                    pass
+                if ws:
+                    try: ws.close()
+                    except Exception: pass
+                # only a connection that actually HELD resets the backoff — a
+                # flapping link keeps escalating instead of retrying every 5s
+                if up and time.time() - up >= 60:
+                    backoff = 5
                 time.sleep(backoff); backoff = min(backoff * 2, 300)
 
     def _handle(self, msg):
@@ -624,11 +607,9 @@ class CloudWS:
 def load_config(options):
     global CFG, DEVICES, KEYS
     CFG = options or {}
-    # devicekeys are AUTO-fetched from the eWeLink cloud (they are in the device
-    # list we already poll) and cached here, so there is no keys file to manage
-    # and LAN keeps working offline after the first cloud sync. On a fresh
-    # install the cache simply is not there yet — that is normal, not an error,
-    # and it refills itself from the next cloud thinglist.
+    # devicekeys are AUTO-fetched from the cloud thinglist and cached here, so
+    # there is no keys file and LAN keeps working offline. A missing cache on a
+    # fresh install is normal — the next cloud poll refills it.
     KEYS = {}
     try:
         with open(KEYCACHE) as f:
@@ -653,7 +634,6 @@ def load_config(options):
             "channels": int(d.get("channels") or 4), "name": d.get("name", did)}
 
 def stdin_loop(bridge):
-    """Every stdin line after config is a control command from index.js."""
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -673,12 +653,10 @@ def stdin_loop(bridge):
                 bridge.control(cfg, {"switch": "on" if on else "off"})
         except Exception as e:          # a bad control line must not kill the thread
             log(f"control line error: {e}")
-    # stdin closed = Signal K is gone → do not orphan a polling worker
-    os._exit(0)
+    os._exit(0)     # stdin closed = Signal K is gone; do not orphan the worker
 
 def main():
-    # the first stdin line is the config; block for it
-    first = sys.stdin.readline()
+    first = sys.stdin.readline()        # the first line is the config; block for it
     try:
         msg = json.loads(first)
         load_config(msg.get("options", {}))
@@ -688,8 +666,8 @@ def main():
     auth = CloudAuth()
     o = CFG.get("oauth", {})
 
-    # A FRESH INSTALL HAS NOTHING. Say exactly what is missing rather than
-    # failing silently — the plugin stays up either way, it just has less to do.
+    # a fresh install has nothing — say exactly what is missing; the plugin
+    # stays up either way, it just has less to do
     code = (o.get("code") or "").strip()
     if code and not auth.credentials():
         auth.exchange(code)
@@ -706,25 +684,23 @@ def main():
         log(url or "(cannot build the login URL without appId and appSecret)")
 
     zc = Zeroconf()
-    bridge = Bridge(zc, auth)
-    ServiceBrowser(zc, "_ewelink._tcp.local.", bridge)   # mDNS discovery always on
-
-    if auth.credentials():
-        log(f"cloud: reconcile every {CFG.get('cloudIntervalS', 60)}s + push")
-        bridge.cloud_poll()
-        CloudWS(auth, bridge).start()
-        if not DEVICES:
-            status("Connected — now pick your devices in the plugin config")
-        else:
-            status(f"{len(DEVICES)} device(s), LAN-first")
-    else:
-        log("no cloud credentials — LAN-discovered devices only")
-
-    threading.Thread(target=stdin_loop, args=(bridge,), daemon=True).start()
-
-    interval = int(CFG.get("cloudIntervalS", 60))
-    n = 0
     try:
+        bridge = Bridge(zc, auth)
+        ServiceBrowser(zc, "_ewelink._tcp.local.", bridge)   # mDNS discovery always on
+
+        if auth.credentials():
+            log(f"cloud: reconcile every {CFG.get('cloudIntervalS', 60)}s + push")
+            bridge.cloud_poll()
+            CloudWS(auth, bridge).start()
+            status(f"{len(DEVICES)} device(s), LAN-first" if DEVICES
+                   else "Connected — now pick your devices in the plugin config")
+        else:
+            log("no cloud credentials — LAN-discovered devices only")
+
+        threading.Thread(target=stdin_loop, args=(bridge,), daemon=True).start()
+
+        interval = int(CFG.get("cloudIntervalS", 60))
+        n = 0
         while True:
             time.sleep(LAN_POLL_S)
             bridge.lan_poll()
