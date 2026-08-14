@@ -2,14 +2,8 @@
 
 ## 1.0.5 — 2026-08-14
 
-- Docs corrected + trimmed: the official Signal K Docker image already ships
-  `python3` and `pip3` (Ubuntu-based), so you only install the Python deps — no
-  custom image; a free eWeLink developer account (dev.ewelink.cc) is required.
-- Internal cleanup + hardening, behaviour unchanged: cut the narration, closed
-  leaked sockets (context managers), narrowed broad `except`s, reset the cloud
-  reconnect backoff only after a stable connection, made a read-only data dir no
-  longer able to crash a token refresh, and a lost stdout now exits cleanly like
-  a lost stdin. Verified live on the boat — data flows, survives a restart.
+- Docs: you install only the Python deps (python3 is already in the official image).
+- Internal hardening; behaviour unchanged.
 
 ## 1.0.4 — 2026-08-13
 
