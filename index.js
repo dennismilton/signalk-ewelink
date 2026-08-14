@@ -21,7 +21,9 @@ const fs = require('fs')
 module.exports = function (app) {
   const plugin = {}
   let child = null
-  let devices = []
+  let stopping = false
+  let gen = 0
+  const lastErr = []                     // ring buffer of recent stderr, for exit reporting
 
   // Tokens, the devicekey cache and the discovery list belong OUTSIDE the plugin
   // install directory — anything written beside plugin.py is destroyed by the
@@ -56,6 +58,7 @@ module.exports = function (app) {
         break
       } catch (e) {}
     }
+    if (!disc || typeof disc !== 'object') disc = {}
     const ids = Object.keys(disc)
     const idField = { type: 'string', title: 'Device' }
     if (ids.length) {
@@ -124,6 +127,11 @@ module.exports = function (app) {
     return [{ path: `${d.basePath}.state`, deviceid: d.id, outlet: null }]
   }
 
+  // the config line plugin.py blocks on at startup. The data dir travels in the
+  // environment instead (SIGNALK_EWELINK_DATA), so the worker knows where its
+  // state lives before it has read a single byte of stdin.
+  const configMsg = (options) => ({ type: 'config', options })
+
   // a command reaches the child only if the child is alive; the boolean says so,
   // so the PUT handler can report FAILURE instead of a false COMPLETED.
   const send = (obj) => {
@@ -132,10 +140,6 @@ module.exports = function (app) {
       app.error('write to plugin.py failed: ' + e.message); return false
     }
   }
-
-  let stopping = false
-  let gen = 0
-  const lastErr = []                     // ring buffer of recent stderr, for exit reporting
 
   const spawnChild = (options) => {
     const pyBin = (options && options.pythonPath) || 'python3'
@@ -183,9 +187,9 @@ module.exports = function (app) {
       if (stopping || myGen !== gen) return
       app.error('plugin.py exited (' + code + '): ' + lastErr.join(' | '))
       app.setPluginError && app.setPluginError('plugin.py exited ' + code)
-      setTimeout(() => { if (!stopping && myGen === gen) { spawnChild(options); send({ type: 'config', options }) } }, 5000)
+      setTimeout(() => { if (!stopping && myGen === gen) { spawnChild(options); send(configMsg(options)) } }, 5000)
     })
-    send({ type: 'config', options })
+    send(configMsg(options))
   }
 
   plugin.start = function (options) {
@@ -194,7 +198,7 @@ module.exports = function (app) {
     // a half-filled row in the config UI must not register a handler on
     // "undefined.state" — drop it here and say so
     const all = options.devices || []
-    devices = all.filter((d) => d && d.id && d.basePath)
+    const devices = all.filter((d) => d && d.id && d.basePath)
     for (let i = devices.length; i < all.length; i++) {
       app.error('device entry ignored: both a Device and a Signal K path are required')
     }
