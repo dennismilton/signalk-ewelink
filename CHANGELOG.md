@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.0.5 — 2026-08-14
+
+- Docs only. Corrected the requirements: the official Signal K Docker image
+  already ships `python3` and `pip3` (it is Ubuntu-based), so you only install
+  the Python deps — no custom image. Also states clearly that a free eWeLink
+  developer account (dev.ewelink.cc) is required.
+
 ## 1.0.4 — 2026-08-13
 
 - **Tokens and caches now survive a reinstall.** OAuth tokens, the device key

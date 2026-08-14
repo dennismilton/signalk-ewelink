@@ -27,8 +27,9 @@ hardware, configured entirely in the Signal K admin UI.
 ## Requirements
 
 - A Signal K node server.
-- **`python3` on the server host**, with the packages in `requirements.txt`
-  (`pycryptodome`, `zeroconf`, `websocket-client`). See [Python deps](#python-deps).
+- **The Python deps** (`pycryptodome`, `zeroconf`, `websocket-client`). `python3`
+  and `pip3` already ship in the official Docker image (Ubuntu-based); you only
+  install these — see [Python deps](#python-deps).
 - For LAN control, the Signal K host must share a network with the devices —
   mDNS does not cross subnets, so a container needs **host networking**.
 - **A free eWeLink _developer_ account** — this is required, and it is *not* your
@@ -50,18 +51,7 @@ Then restart the server and enable the plugin in **Server → Plugin Config**.
 
 ### Python deps
 
-The worker is Python, so install its dependencies against the same `python3`
-the Signal K server runs:
-
-```sh
-python3 -m pip install -r requirements.txt
-```
-
-On modern Debian/Raspberry Pi OS (and the official Docker image, which is
-Ubuntu-based) `pip` is "externally managed", so either add
-`--break-system-packages`, use a venv, or vendor the deps inside the plugin
-directory (self-contained, and it survives across the plugin's own reinstalls
-only if you re-run it):
+The worker is Python. Install its deps into the plugin:
 
 ```sh
 cd ~/.signalk/node_modules/signalk-ewelink
