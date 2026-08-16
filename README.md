@@ -41,6 +41,24 @@ python3 -m pip install --target vendor/ -r requirements.txt
 
 Restart the server and enable the plugin.
 
+> **`vendor/` does not survive a plugin upgrade.** It lives inside the package
+> directory, which npm replaces wholesale when you update the plugin — and if
+> SignalK runs from a stock Docker image, installing deps *into the container*
+> is worse still, since any recreate wipes them. Either way the plugin degrades
+> the way it is designed to, quietly: no error, no log line, the
+> `electrical.*` paths just stop appearing and whatever reads them goes dead.
+>
+> For a long-lived install, put the deps somewhere neither npm nor Docker
+> touches — the mounted config dir — and point Python at it:
+>
+> ```sh
+> python3 -m pip install --target ~/.signalk/pylibs -r requirements.txt
+> # Docker: add PYTHONPATH=/home/node/.signalk/pylibs to the service environment
+> ```
+>
+> Verify after any upgrade by checking the paths are still on the bus, not by
+> checking that the plugin is enabled.
+
 ## Configure (admin UI)
 
 1. **Create an app** at [dev.ewelink.cc](https://dev.ewelink.cc): note the **App
